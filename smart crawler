@@ -1,0 +1,223 @@
+"""
+SmartCrawler — unified crawling engine.
+
+Automatically combines URL-based crawling AND sidebar navigation crawling
+so nothing is missed:
+
+  Phase 1 — URL Crawl
+    Follows every <a href> link within the same domain (up to max_pages).
+    Captures pages that are reachable via direct URLs (login, registration,
+    public pages, admin panels with direct links, etc.)
+
+  Phase 2 — Sidebar Navigation Crawl
+    After login, detects the sidebar menu tree and clicks through every
+    menu item → sub-menu item → leaf item.
+    For each click that loads a new form/view, extracts all DOM elements.
+    This captures SPA routes that never appear as href links.
+
+  Phase 3 — Deduplication
+    Merges results from both phases, removes pages with identical content
+    fingerprints, ensures every unique form/view appears exactly once.
+
+Result: a single List[PageInfo] covering every reachable page in the app.
+"""
+
+import hashlib
+from typing import Callable, List, Optional
+
+from services.web_crawler import WebCrawler, PageInfo, summarize_crawl_for_llm
+from services.sidebar_crawler import SidebarCrawler
+from utils.logger import AppLogger
+
+logger = AppLogger.get_logger("smart_crawler")
+
+
+class SmartCrawler:
+    """
+    One crawler to rule them all.
+    Runs URL crawl + sidebar crawl and merges the unique results.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        username: str = "",
+        password: str = "",
+        login_url: str = "",
+        username_selector: str = "",
+        password_selector: str = "",
+        submit_selector: str = "",
+        max_url_pages: int = 10,
+        max_sidebar_views: int = 40,
+        headless: bool = True,
+        progress_callback: Optional[Callable[[str], None]] = None,
+        screenshot_dir: str = "./logs/screenshots",
+    ):
+        self.base_url         = base_url.rstrip("/")
+        self.username         = username
+        self.password         = password
+        self.login_url        = (login_url or base_url).rstrip("/")
+        self.username_sel     = username_selector
+        self.password_sel     = password_selector
+        self.submit_sel       = submit_selector
+        self.max_url_pages    = max_url_pages
+        self.max_sidebar_views = max_sidebar_views
+        self.headless         = headless
+        self.cb               = progress_callback or (lambda m: None)
+        self.screenshot_dir   = screenshot_dir
+
+    # ------------------------------------------------------------------ #
+
+    def crawl(self) -> List[PageInfo]:
+        """
+        Run both phases and return a merged, deduplicated list of PageInfo.
+        """
+        all_pages: List[PageInfo] = []
+
+        # ── Phase 1: URL-based crawl ──────────────────────────────────
+        self.cb("=" * 50)
+        self.cb("PHASE 1 — URL Crawl (following hyperlinks)")
+        self.cb("=" * 50)
+
+        try:
+            url_crawler = WebCrawler(
+                base_url=self.base_url,
+                username=self.username,
+                password=self.password,
+                login_url=self.login_url,
+                username_selector=self.username_sel,
+                password_selector=self.password_sel,
+                submit_selector=self.submit_sel,
+                max_pages=self.max_url_pages,
+                headless=self.headless,
+                progress_callback=self.cb,
+                screenshot_dir=self.screenshot_dir,
+            )
+            url_pages = url_crawler.crawl()
+            all_pages.extend(url_pages)
+            self.cb(f"Phase 1 complete — {len(url_pages)} pages from URL crawl")
+            logger.info(f"URL crawl: {len(url_pages)} pages")
+        except Exception as exc:
+            self.cb(f"[WARN] URL crawl failed: {exc}")
+            logger.warning(f"URL crawl error: {exc}")
+
+        # ── Phase 2: Sidebar navigation crawl ────────────────────────
+        self.cb("")
+        self.cb("=" * 50)
+        self.cb("PHASE 2 — Sidebar Navigation Crawl")
+        self.cb("=" * 50)
+
+        try:
+            from playwright.sync_api import sync_playwright
+
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(
+                    headless=self.headless,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--disable-notifications",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                    ],
+                )
+                ctx = browser.new_context(
+                    viewport={"width": 1440, "height": 900},
+                    ignore_https_errors=True,
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/125.0.0.0 Safari/537.36"
+                    ),
+                )
+                page = ctx.new_page()
+
+                # Login
+                wc = WebCrawler(
+                    base_url=self.base_url,
+                    username=self.username,
+                    password=self.password,
+                    login_url=self.login_url,
+                    username_selector=self.username_sel,
+                    password_selector=self.password_sel,
+                    submit_selector=self.submit_sel,
+                    progress_callback=self.cb,
+                )
+
+                if self.username and self.password:
+                    ok = wc._login(page)
+                    if not ok:
+                        self.cb("[WARN] Sidebar crawl login uncertain — trying anyway")
+                else:
+                    page.goto(self.base_url, wait_until="networkidle", timeout=30000)
+                    wc._dismiss_overlays(page)
+
+                self.cb(f"Sidebar crawl — logged in at: {page.url}")
+
+                sidebar_crawler = SidebarCrawler(
+                    page=page,
+                    progress_callback=self.cb,
+                    screenshot_dir=self.screenshot_dir,
+                    max_depth=4,
+                )
+                sidebar_pages = sidebar_crawler.crawl()
+                browser.close()
+
+            all_pages.extend(sidebar_pages)
+            self.cb(f"Phase 2 complete — {len(sidebar_pages)} views from sidebar crawl")
+            logger.info(f"Sidebar crawl: {len(sidebar_pages)} views")
+
+        except Exception as exc:
+            self.cb(f"[WARN] Sidebar crawl failed: {exc}")
+            logger.warning(f"Sidebar crawl error: {exc}", exc_info=True)
+
+        # ── Phase 3: Deduplicate ──────────────────────────────────────
+        self.cb("")
+        self.cb("=" * 50)
+        self.cb("PHASE 3 — Deduplication")
+        self.cb("=" * 50)
+
+        unique_pages = _deduplicate_pages(all_pages)
+        removed      = len(all_pages) - len(unique_pages)
+
+        self.cb(f"Total collected : {len(all_pages)}")
+        self.cb(f"Duplicates removed: {removed}")
+        self.cb(f"Unique views    : {len(unique_pages)}")
+        logger.info(
+            f"SmartCrawler done: {len(unique_pages)} unique pages "
+            f"({len(url_pages if 'url_pages' in dir() else [])} URL + "  # noqa
+            f"{len(sidebar_pages if 'sidebar_pages' in dir() else [])} sidebar)"  # noqa
+        )
+
+        total_elements = sum(len(p.elements) for p in unique_pages)
+        self.cb(f"Total elements extracted: {total_elements}")
+        self.cb("=" * 50)
+
+        return unique_pages
+
+
+# ------------------------------------------------------------------ #
+#  Deduplication                                                        #
+# ------------------------------------------------------------------ #
+
+def _page_fingerprint(page: PageInfo) -> str:
+    """
+    A page is 'the same' if its title + top-10 element locators match.
+    This handles SPAs where the URL stays the same but content changes,
+    and also handles different URLs with identical forms.
+    """
+    locators = sorted(
+        e.best_locator for e in page.elements[:20] if e.best_locator
+    )
+    key = (page.title or "") + "|" + "|".join(locators[:10])
+    return hashlib.md5(key.encode()).hexdigest()
+
+
+def _deduplicate_pages(pages: List[PageInfo]) -> List[PageInfo]:
+    seen: set = set()
+    result: List[PageInfo] = []
+    for p in pages:
+        fp = _page_fingerprint(p)
+        if fp not in seen:
+            seen.add(fp)
+            result.append(p)
+    return result
