@@ -1,0 +1,483 @@
+"""
+Sidebar-Navigation Crawler
+==========================
+Designed for enterprise banking / ERP / dashboard applications (like SBI TGEN)
+where the entire application is navigated through a sidebar menu tree rather
+than through hyperlinks.
+
+Algorithm
+---------
+1.  Detect the sidebar container using 20+ selector patterns.
+2.  Take a snapshot of all top-level clickable menu items.
+3.  For each item:
+      a. Record the current main-content fingerprint.
+      b. Click the item.
+      c. Wait for the page to settle (network + 800ms debounce).
+      d. If the SIDEBAR expanded to reveal new children → recurse into them.
+      e. If the MAIN CONTENT changed → extract the form / DOM from this view.
+      f. Both (d) and (e) can be true simultaneously.
+4.  Recurse up to MAX_DEPTH levels deep.
+5.  Return one PageInfo per unique form/view encountered.
+
+What is extracted per view
+--------------------------
+• Every input field  (text, email, password, date, number, file, …)
+• Every dropdown     (select + all options, custom combobox)
+• Every button       (submit, action, icon buttons)
+• Every checkbox / radio / toggle
+• Every table        (headers + row count)
+• Navigation breadcrumb
+• Page title / H1
+
+Locator priority per element
+-----------------------------
+data-testid  >  stable-id  >  name  >  aria-label  >
+placeholder  >  title  >  xpath-by-text  >  css-type+name
+"""
+
+import hashlib
+import re
+import time
+import base64
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Set, Tuple
+
+from utils.logger import AppLogger
+# Reuse data models and JS from web_crawler
+from services.web_crawler import (
+    PageInfo, ElementInfo, FormInfo, TableInfo,
+    _build_element_info, _deduplicate, _url_to_page_name,
+    _EXTRACT_JS,
+)
+
+logger = AppLogger.get_logger("sidebar_crawler")
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Configuration constants
+# ════════════════════════════════════════════════════════════════════
+
+MAX_DEPTH          = 4      # maximum menu nesting depth
+CONTENT_WAIT_MS    = 1200   # ms to wait after clicking before extracting
+EXPAND_WAIT_MS     = 600    # ms to wait after clicking an expandable item
+MAX_ITEMS_PER_MENU = 40     # safety limit per menu level
+
+# Sidebar container selectors — ordered most-specific → generic
+SIDEBAR_SELECTORS = [
+    # id-based
+    "#sidebar", "#mainSidebar", "#leftNav", "#leftMenu",
+    "#sideMenu", "#navMenu", "#mainMenu", "#main-menu",
+    "#side-nav", "#sidenav",
+    # class-based
+    ".sidebar", ".main-sidebar", ".left-sidebar",
+    ".side-nav", ".side-menu", ".nav-sidebar",
+    ".main-menu", ".sidenav", ".left-menu",
+    ".menu-wrapper", ".nav-wrapper",
+    # attribute-based
+    "[class*='sidebar']", "[class*='Sidebar']",
+    "[class*='main-menu']", "[class*='MainMenu']",
+    "[class*='side-nav']", "[class*='SideNav']",
+    "[class*='left-menu']", "[class*='LeftMenu']",
+    # aria
+    "[role='navigation']", "[role='tree']",
+    # generic fallback
+    "nav", "aside",
+]
+
+# Selectors for individual menu items INSIDE the sidebar
+MENU_ITEM_SELECTORS = [
+    # list-item based
+    "li.menu-item", "li.nav-item", "li.sidebar-item",
+    "li.sidebar-link", "li.menu-link",
+    # link / span / div children
+    "li > a", "li > span.menu-title", "li > div.menu-item",
+    # class-based
+    "[class*='menu-item']", "[class*='MenuItem']",
+    "[class*='nav-item']",  "[class*='NavItem']",
+    "[class*='sidebar-item']", "[class*='SidebarItem']",
+    "[class*='menu-link']",    "[class*='MenuLink']",
+    # role-based
+    "[role='treeitem']", "[role='menuitem']",
+    # direct text-bearing anchors inside nav/aside
+    "a[href]",
+]
+
+# Indicators that a menu item HAS sub-items (arrow, chevron, caret, etc.)
+EXPANDABLE_INDICATORS = [
+    "[class*='arrow']",   "[class*='Arrow']",
+    "[class*='chevron']", "[class*='Chevron']",
+    "[class*='caret']",   "[class*='Caret']",
+    "[class*='toggle']",  "[class*='Toggle']",
+    "[class*='expand']",  "[class*='Expand']",
+    "i.fa-angle-right", "i.fa-caret-right", "i.fa-chevron-right",
+    "i.fa-angle-down",  "i.fa-caret-down",  "i.fa-chevron-down",
+    "span.arrow", "span.caret", "span.toggle",
+    "svg[class*='arrow']", "svg[class*='chevron']",
+]
+
+# Selectors that are definitely NOT page links (skip them)
+SKIP_TEXT_PATTERNS = re.compile(
+    r"^(main menu|menu|navigation|nav|home|#|\s*)$",
+    re.IGNORECASE,
+)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  SidebarCrawler
+# ════════════════════════════════════════════════════════════════════
+
+class SidebarCrawler:
+    """
+    Navigate an application entirely through its sidebar menu tree,
+    extracting DOM elements and locators from every unique form/view.
+    """
+
+    def __init__(
+        self,
+        page,                              # Playwright Page object
+        progress_callback: Optional[Callable[[str], None]] = None,
+        screenshot_dir: str = "./logs/screenshots",
+        max_depth: int = MAX_DEPTH,
+    ):
+        self.page            = page
+        self.cb              = progress_callback or (lambda m: None)
+        self.screenshot_dir  = screenshot_dir
+        self.max_depth       = max_depth
+        self._visited_labels: Set[str] = set()
+        self._extracted: List[PageInfo] = []
+
+    # ──────────────────────────────────────────────────────────────
+    #  Public entry
+    # ──────────────────────────────────────────────────────────────
+
+    def crawl(self) -> List[PageInfo]:
+        """
+        Returns a list of PageInfo objects — one per unique view/form
+        discovered by navigating through every sidebar menu item.
+        """
+        self.cb("Detecting sidebar container…")
+        sidebar_sel = self._detect_sidebar()
+
+        if not sidebar_sel:
+            self.cb("[WARN] No sidebar detected — returning empty list")
+            logger.warning("SidebarCrawler: sidebar not found")
+            return []
+
+        self.cb(f"Sidebar found: {sidebar_sel}")
+        logger.info(f"Sidebar container: {sidebar_sel}")
+
+        # Extract first-level items before any clicks
+        top_items = self._get_items_in(sidebar_sel)
+        self.cb(f"Found {len(top_items)} top-level menu items")
+        logger.info(f"Top-level items: {len(top_items)}")
+
+        for label, item_sel in top_items:
+            self._process_item(
+                item_selector=item_sel,
+                label=label,
+                sidebar_sel=sidebar_sel,
+                level=0,
+                breadcrumb=[],
+            )
+
+        total = len(self._extracted)
+        self.cb(f"Sidebar crawl complete — {total} unique form/view(s) extracted")
+        logger.info(f"SidebarCrawler finished: {total} pages")
+        return self._extracted
+
+    # ──────────────────────────────────────────────────────────────
+    #  Sidebar detection
+    # ──────────────────────────────────────────────────────────────
+
+    def _detect_sidebar(self) -> Optional[str]:
+        """Try every SIDEBAR_SELECTORS entry, return the first that matches."""
+        for sel in SIDEBAR_SELECTORS:
+            try:
+                loc = self.page.locator(sel)
+                if loc.count() > 0 and loc.first.is_visible():
+                    # Quick sanity: must contain at least 3 clickable children
+                    children = loc.first.locator("a, button, li, [role='menuitem']")
+                    if children.count() >= 3:
+                        return sel
+            except Exception:
+                continue
+        return None
+
+    # ──────────────────────────────────────────────────────────────
+    #  Item discovery
+    # ──────────────────────────────────────────────────────────────
+
+    def _get_items_in(self, container_sel: str) -> List[Tuple[str, str]]:
+        """
+        Return (label, unique_selector) pairs for direct clickable children
+        of the given container. Skips hidden items and no-text items.
+        """
+        items: List[Tuple[str, str]] = []
+        seen_labels: Set[str] = set()
+
+        for item_sel in MENU_ITEM_SELECTORS:
+            try:
+                # Only direct descendants to avoid duplicates from sub-menus
+                combined = f"{container_sel} > {item_sel}, {container_sel} > li > {item_sel}"
+                locs = self.page.locator(f"{container_sel} {item_sel}")
+                n = min(locs.count(), MAX_ITEMS_PER_MENU)
+
+                for i in range(n):
+                    try:
+                        loc = locs.nth(i)
+                        if not loc.is_visible():
+                            continue
+                        txt = _clean_text(loc.inner_text())
+                        if not txt or txt in seen_labels or SKIP_TEXT_PATTERNS.match(txt):
+                            continue
+                        seen_labels.add(txt)
+                        # Build a unique selector using nth-match
+                        nth_sel = f"{container_sel} {item_sel} >> nth={i}"
+                        items.append((txt, nth_sel))
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+            if items:
+                break  # Use first selector that found items
+
+        return items
+
+    # ──────────────────────────────────────────────────────────────
+    #  Recursive item processor
+    # ──────────────────────────────────────────────────────────────
+
+    def _process_item(
+        self,
+        item_selector: str,
+        label: str,
+        sidebar_sel: str,
+        level: int,
+        breadcrumb: List[str],
+    ):
+        if level > self.max_depth:
+            return
+        if label in self._visited_labels:
+            return
+
+        indent = "  " * level
+        full_path = " > ".join(breadcrumb + [label])
+        self.cb(f"{indent}↳ {label}")
+        logger.info(f"Menu item [{level}]: {full_path}")
+
+        # ── Snapshot BEFORE click ─────────────────────────────────
+        content_before  = self._content_fingerprint()
+        sidebar_count   = self._sidebar_item_count(sidebar_sel)
+
+        # ── Click ─────────────────────────────────────────────────
+        try:
+            loc = self.page.locator(item_selector).first
+            loc.scroll_into_view_if_needed()
+            loc.click(timeout=5000)
+        except Exception as exc:
+            logger.warning(f"Could not click '{label}': {exc}")
+            return
+
+        # ── Wait ──────────────────────────────────────────────────
+        try:
+            self.page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        self.page.wait_for_timeout(CONTENT_WAIT_MS)
+
+        # ── Check what changed ────────────────────────────────────
+        content_after = self._content_fingerprint()
+        new_sidebar_count = self._sidebar_item_count(sidebar_sel)
+
+        content_changed = content_after != content_before
+        sidebar_expanded = new_sidebar_count > sidebar_count
+
+        # ── Case A: sidebar expanded → discover and recurse ───────
+        if sidebar_expanded:
+            self.cb(f"{indent}  ↕ Expanded ({new_sidebar_count - sidebar_count} new items)")
+            logger.info(f"Sidebar expanded after clicking '{label}'")
+
+            new_items = self._get_items_in(sidebar_sel)
+            # Filter to only newly visible items (not already visited)
+            unvisited = [
+                (lbl, sel) for lbl, sel in new_items
+                if lbl not in self._visited_labels and lbl != label
+            ]
+
+            for child_label, child_sel in unvisited:
+                self._process_item(
+                    item_selector=child_sel,
+                    label=child_label,
+                    sidebar_sel=sidebar_sel,
+                    level=level + 1,
+                    breadcrumb=breadcrumb + [label],
+                )
+
+            # After recursing children, collapse this item if still expanded
+            # (so the next sibling is at the right nesting level)
+            try:
+                self.page.locator(item_selector).first.click(timeout=2000)
+                self.page.wait_for_timeout(300)
+            except Exception:
+                pass
+
+        # ── Case B: main content changed → extract this form ─────
+        if content_changed and not sidebar_expanded:
+            self._visited_labels.add(label)
+            self.cb(f"{indent}  ✦ Extracting form: {full_path}")
+            logger.info(f"Extracting form view: {full_path}")
+
+            page_info = self._extract_current_view(full_path, label)
+            if page_info and page_info.elements:
+                self._extracted.append(page_info)
+                self.cb(
+                    f"{indent}    → {len(page_info.elements)} elements, "
+                    f"{len(page_info.forms)} forms, "
+                    f"{len(page_info.tables)} tables"
+                )
+            elif page_info:
+                self.cb(f"{indent}    → (no elements found on this view)")
+
+        # ── Case C: both happened (parent that also has its own form) ──
+        elif content_changed and sidebar_expanded:
+            self._visited_labels.add(label)
+            # Extract the parent's own content too
+            page_info = self._extract_current_view(full_path, label)
+            if page_info and page_info.elements:
+                self._extracted.append(page_info)
+
+        # ── Case D: nothing changed ───────────────────────────────
+        elif not content_changed and not sidebar_expanded:
+            logger.debug(f"No change after clicking '{label}' — possible dead link or same view")
+            self._visited_labels.add(label)
+
+    # ──────────────────────────────────────────────────────────────
+    #  Page extraction
+    # ──────────────────────────────────────────────────────────────
+
+    def _extract_current_view(self, full_path: str, label: str) -> Optional[PageInfo]:
+        """Run the comprehensive JS extraction on the current view."""
+        url        = self.page.url
+        title      = self.page.title() or label
+        page_name  = _clean_text(label).replace(" ", "") + "Page"
+
+        # Scroll to expose lazy content in the form area
+        try:
+            self.page.evaluate(
+                "document.querySelector('main,#main,#content,.content,.main-content,"
+                ".page-content,.form-area,form') && "
+                "document.querySelector('main,#main,#content,.content,.main-content,"
+                ".page-content,.form-area,form').scrollIntoView()"
+            )
+        except Exception:
+            pass
+        self.page.wait_for_timeout(300)
+
+        try:
+            raw = self.page.evaluate(_EXTRACT_JS)
+        except Exception as exc:
+            logger.error(f"JS extraction failed for '{label}': {exc}")
+            return None
+
+        elements = _deduplicate([_build_element_info(e) for e in raw.get("elements", [])])
+
+        forms = [
+            FormInfo(
+                form_id=f.get("id", ""),
+                form_name=f.get("name", ""),
+                action=f.get("action", ""),
+                method=f.get("method", "get"),
+                fields=f.get("fields", []),
+            )
+            for f in raw.get("forms", [])
+        ]
+
+        tables = [
+            TableInfo(
+                table_id=t.get("id", ""),
+                headers=t.get("headers", []),
+                row_count=t.get("rowCount", 0),
+                best_locator=t.get("bestLocator", "table"),
+            )
+            for t in raw.get("tables", [])
+        ]
+
+        nav_links = []
+        for nav in raw.get("navigation", []):
+            nav_links.extend(nav.get("links", []))
+
+        meta = raw.get("meta", {})
+        ss   = self._screenshot(page_name)
+
+        return PageInfo(
+            url=url,
+            title=title,
+            page_name=page_name,
+            h1=meta.get("h1", label),
+            elements=elements,
+            forms=forms,
+            tables=tables,
+            nav_links=nav_links,
+            all_links=[],
+            screenshot_b64=ss,
+        )
+
+    # ──────────────────────────────────────────────────────────────
+    #  Helpers
+    # ──────────────────────────────────────────────────────────────
+
+    def _content_fingerprint(self) -> str:
+        """MD5 of the main content area text — cheap change-detection."""
+        try:
+            text = self.page.evaluate(
+                """
+                () => {
+                    const sel = [
+                        'main','#main','#content','.content',
+                        '.main-content','.page-content','.container-fluid',
+                        '.form-container','.form-wrapper','form',
+                        '[class*="content"]','[class*="Content"]'
+                    ];
+                    for (const s of sel) {
+                        const el = document.querySelector(s);
+                        if (el) return el.innerText || '';
+                    }
+                    return document.body.innerText || '';
+                }
+                """
+            )
+            return hashlib.md5((text or "").encode()).hexdigest()
+        except Exception:
+            return ""
+
+    def _sidebar_item_count(self, sidebar_sel: str) -> int:
+        """Count visible items in the sidebar (to detect expansion)."""
+        try:
+            return self.page.locator(
+                f"{sidebar_sel} a:visible, {sidebar_sel} li:visible, "
+                f"{sidebar_sel} [role='menuitem']:visible"
+            ).count()
+        except Exception:
+            return 0
+
+    def _screenshot(self, label: str) -> str:
+        try:
+            ss = self.page.screenshot(full_page=False)
+            b64 = base64.b64encode(ss).decode()
+            if self.screenshot_dir:
+                p = Path(self.screenshot_dir) / f"{label}.png"
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(ss)
+            return b64
+        except Exception:
+            return ""
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Utility
+# ════════════════════════════════════════════════════════════════════
+
+def _clean_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip()
